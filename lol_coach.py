@@ -91,10 +91,10 @@ Regole:
 """
 
 WELCOME_MESSAGE = (
-    "Modalità **tempo reale** attiva. "
-    "1) Avvia una partita LoL (anche Practice Tool) per la **Live Client API**. "
-    "2) Attiva il **feed schermo continuo** sul monitor del gioco. "
-    "Poi **🎙️ Chiedi al Coach**: vede lo stato live della partita, non uno screenshot singolo."
+    "Modalità **tempo reale** via **feed schermo continuo** (nessuna API Riot da registrare). "
+    "Scegli il monitor di LoL nella sidebar, lascia il feed attivo, poi "
+    "**🎙️ Chiedi al Coach**: usa gli ultimi frame della partita. "
+    "Opzionale: la Live Client locale (senza API key) se vuoi anche gold/KDA strutturati."
 )
 
 
@@ -303,12 +303,14 @@ def collect_realtime_context() -> tuple[str, list[bytes], str]:
         else:
             st.session_state["live_client_last_ok"] = False
             st.session_state["live_client_last_error"] = err
+            # Non inquinare il prompt se l'utente ha attivato l'extra ma non è in partita:
+            # un avviso corto basta; il feed schermo resta la fonte principale.
             chunks.append(
-                "=== LIVE CLIENT ===\n"
-                f"Non disponibile: {err}\n"
-                "(Avvia una partita o Practice Tool. L'API è su https://127.0.0.1:2999)"
+                "=== LIVE CLIENT (opzionale) ===\n"
+                f"Non disponibile ora: {err}\n"
+                "Ignora questo blocco e basa il consiglio sui frame del feed video."
             )
-            sources.append("Live Client API (offline)")
+            sources.append("Live Client (offline)")
 
     if st.session_state.get("live_screen_feed", True):
         sync_live_feed()
@@ -434,7 +436,8 @@ def init_session_state() -> None:
         "tts_enabled": True,
         "fast_mode": True,
         "early_tts": True,
-        "live_client_api": True,
+        # Default: solo feed schermo (niente API). Live Client è opzionale e locale (no API key).
+        "live_client_api": False,
         "live_screen_feed": True,
         "live_fps": 2.0,
         "live_frame_count": 3,
@@ -483,17 +486,29 @@ def render_sidebar() -> None:
         )
 
         st.divider()
-        st.subheader("🔴 Tempo reale")
-        st.session_state.live_client_api = st.toggle(
-            "Live Client API (stato partita Riot)",
-            value=st.session_state.live_client_api,
-            help="Legge gold, KDA, eventi, HP ecc. da https://127.0.0.1:2999 mentre giochi.",
-        )
+        st.subheader("🔴 Tempo reale (senza account Riot)")
         st.session_state.live_screen_feed = st.toggle(
-            "Feed schermo continuo (vede la partita)",
+            "Feed schermo continuo (consigliato)",
             value=st.session_state.live_screen_feed,
-            help="Cattura frame in background (~2 FPS). Alla domanda invia gli ultimi frame, non uno screen singolo.",
+            help=(
+                "Cattura la partita in background (~2 FPS). "
+                "Non serve alcuna API Riot: alla domanda invia gli ultimi frame."
+            ),
         )
+        st.session_state.live_client_api = st.toggle(
+            "Extra opzionale: Live Client locale",
+            value=st.session_state.live_client_api,
+            help=(
+                "NON è l'API Developer di Riot (niente registrazione / API key). "
+                "È un endpoint locale del client LoL su 127.0.0.1:2999, attivo solo in partita. "
+                "Puoi lasciarlo OFF: il coach funziona col solo feed schermo."
+            ),
+        )
+        if st.session_state.live_client_api:
+            st.caption(
+                "ℹ️ Live Client = dati dal tuo PC durante la partita, "
+                "**senza** developer portal Riot. Se non ti interessa, spegnila."
+            )
 
         monitors = list_monitors()
         labels = [label for _, label in monitors]
@@ -581,9 +596,9 @@ def render_sidebar() -> None:
 
         st.divider()
         st.markdown(
-            "**Tempo reale ≠ screenshot:** la Live Client API aggiorna lo stato "
-            "di gioco continuamente; il feed cattura la partita in background. "
-            "LoL in *borderless*, app sul 2° monitor."
+            "**Non serve l’API Riot pubblica.** Il coach guarda la partita dal "
+            "**feed schermo continuo**. LoL in *borderless*, app sul 2° monitor, "
+            "seleziona il monitor di gioco qui sopra."
         )
 
 
@@ -681,7 +696,7 @@ def main() -> None:
 
     st.title("⚔️ LoL Coach — Tempo reale")
     st.caption(
-        "Vede la partita in live (Riot Live Client + feed schermo continuo) · "
+        "Vede la partita dal feed schermo continuo (niente API key Riot) · "
         f"modello `{active_model_name()}`"
     )
 
