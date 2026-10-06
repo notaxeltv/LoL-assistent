@@ -1,9 +1,9 @@
 """
-LoL Coach — Assistente vocale (+ visione schermo) per League of Legends.
+LoL Coach — assistente vocale con visione DELLA PARTITA IN TEMPO REALE.
 
-- Microfono → domanda in italiano
-- Screenshot dello schermo → modello vision Ollama (opzionale)
-- Risposte brevi in streaming, TTS che parte già dalla prima frase
+Fonti tempo reale:
+1) Riot Live Client Data API (stato strutturato mentre giochi)
+2) Feed schermo continuo (ring buffer di frame, non screenshot singolo)
 
 Avvio:
     streamlit run lol_coach.py
@@ -11,7 +11,6 @@ Avvio:
 
 from __future__ import annotations
 
-import io
 import platform
 import re
 import sys
@@ -19,8 +18,10 @@ from typing import Generator
 
 import streamlit as st
 
+from live_game import LIVE_FEED, get_live_game_briefing
+
 # ---------------------------------------------------------------------------
-# Dipendenze opzionali a runtime
+# Dipendenze opzionali
 # ---------------------------------------------------------------------------
 try:
     import ollama
@@ -49,14 +50,12 @@ except ImportError:  # pragma: no cover
 # Configurazione
 # ---------------------------------------------------------------------------
 DEFAULT_TEXT_MODEL = "qwen"
-DEFAULT_VISION_MODEL = "qwen2.5vl"  # richiede: ollama pull qwen2.5vl
+DEFAULT_VISION_MODEL = "qwen2.5vl"
 SPEECH_LANG = "it-IT"
 TTS_RATE_NORMAL = 175
 TTS_RATE_FAST = 200
-PAGE_TITLE = "LoL Coach — Assistente Vocale"
+PAGE_TITLE = "LoL Coach — Tempo Reale"
 PAGE_ICON = "⚔️"
-
-# Limiti generazione: meno token = risposta più veloce in partita
 NUM_PREDICT_NORMAL = 160
 NUM_PREDICT_FAST = 80
 
@@ -73,33 +72,59 @@ RANKS = [
     "Master+",
 ]
 
-SYSTEM_PROMPT_TEMPLATE = """Sei un coach vocale di League of Legends. L'utente ti parla DURANTE una partita.
+SYSTEM_PROMPT_TEMPLATE = """Sei un coach vocale di League of Legends in TEMPO REALE.
 
-Contesto:
+Contesto utente:
 - Ruolo: {role}
-- Campione: {champion}
+- Campione dichiarato: {champion}
 - Elo/Rank: {rank}
-- Avversario / note: {enemy_notes}
-- Visione schermo: {vision_mode}
+- Note: {enemy_notes}
+- Fonti live: {live_sources}
 - Modalità: {speed_mode}
 
 Regole:
-1. Rispondi SEMPRE in italiano, come un coach in cuffia.
+1. Rispondi SEMPRE in italiano, da coach in cuffia.
 2. {brevity_rule}
-3. Priorità: cosa fare ORA (trade, farm, obiettivo, posizione, summoner, item).
-4. Se c'è uno screenshot, usalo: mini-map, HP/mana, wave, ultimates, obiettivi, gold/items visibili. Non descrivere lo schermo: dai il consiglio.
-5. Niente markdown pesante, niente guide lunghe. Massimo UNA domanda breve se serve.
+3. Usa i dati LIVE CLIENT (scoreboard, gold, eventi, HP) come verità sulla partita: sono aggiornati in tempo reale.
+4. Se ci sono frame recenti del feed video, usali per posizione/wave/obiettivi visibili — non descrivere i frame, dai il consiglio.
+5. Priorità: cosa fare ORA. Niente guide lunghe, niente markdown pesante.
 """
 
 WELCOME_MESSAGE = (
-    "Pronto. Imposta **ruolo/campione** nella sidebar. "
-    "Attiva **Vedi lo schermo** se hai un modello vision (`qwen2.5vl` / `llava`), "
-    "poi **🎙️ Chiedi al Coach**: ascolto + (opzionale) screenshot → consiglio vocale rapido."
+    "Modalità **tempo reale** attiva. "
+    "1) Avvia una partita LoL (anche Practice Tool) per la **Live Client API**. "
+    "2) Attiva il **feed schermo continuo** sul monitor del gioco. "
+    "Poi **🎙️ Chiedi al Coach**: vede lo stato live della partita, non uno screenshot singolo."
 )
 
 
 # ---------------------------------------------------------------------------
-# Helper velocità / modelli
+# Monitor helper (UI)
+# ---------------------------------------------------------------------------
+def list_monitors() -> list[tuple[int, str]]:
+    if mss is None:
+        return [(1, "Monitor 1 (installa mss + Pillow)")]
+    try:
+        labels: list[tuple[int, str]] = []
+        with mss.mss() as sct:
+            for idx, mon in enumerate(sct.monitors):
+                if idx == 0:
+                    labels.append((0, f"Tutti i monitor ({mon['width']}x{mon['height']})"))
+                else:
+                    labels.append(
+                        (
+                            idx,
+                            f"Monitor {idx} ({mon['width']}x{mon['height']} "
+                            f"@ {mon['left']},{mon['top']})",
+                        )
+                    )
+        return labels or [(1, "Monitor 1")]
+    except Exception as exc:
+        return [(1, f"Monitor 1 (rilevamento fallito: {exc})")]
+
+
+# ---------------------------------------------------------------------------
+# Velocità / modello
 # ---------------------------------------------------------------------------
 def is_fast_mode() -> bool:
     return bool(st.session_state.get("fast_mode", True))
@@ -113,14 +138,32 @@ def active_num_predict() -> int:
     return NUM_PREDICT_FAST if is_fast_mode() else NUM_PREDICT_NORMAL
 
 
+def uses_vision_frames() -> bool:
+    return bool(st.session_state.get("live_screen_feed", True))
+
+
 def active_model_name() -> str:
-    if st.session_state.get("screen_vision", True):
+    if uses_vision_frames():
         return (st.session_state.get("vision_model") or DEFAULT_VISION_MODEL).strip()
     return (st.session_state.get("text_model") or DEFAULT_TEXT_MODEL).strip()
 
 
+def sync_live_feed() -> None:
+    """Avvia/ferma/configura il thread di cattura continua in base alla sidebar."""
+    want = bool(st.session_state.get("live_screen_feed", True))
+    LIVE_FEED.configure(
+        monitor_index=int(st.session_state.get("monitor_index", 1)),
+        fps=float(st.session_state.get("live_fps", 2.0)),
+        max_width=960,
+    )
+    if want and not LIVE_FEED.running:
+        LIVE_FEED.start()
+    elif not want and LIVE_FEED.running:
+        LIVE_FEED.stop()
+
+
 # ---------------------------------------------------------------------------
-# Sintesi vocale (pyttsx3)
+# TTS
 # ---------------------------------------------------------------------------
 def _tts_driver_name() -> str | None:
     system = platform.system()
@@ -136,7 +179,6 @@ def _pick_italian_voice(engine: "pyttsx3.Engine") -> str | None:
         voices = engine.getProperty("voices") or []
     except Exception:
         return None
-
     keywords = ("italian", "italiano", "italy", "it-it", "it_it", "it_IT")
     for voice in voices:
         parts = [getattr(voice, "id", "") or "", getattr(voice, "name", "") or ""]
@@ -148,32 +190,17 @@ def _pick_italian_voice(engine: "pyttsx3.Engine") -> str | None:
                     parts.append(str(lang))
             else:
                 parts.append(str(lang))
-        haystack = " ".join(parts).lower()
-        if any(k in haystack for k in keywords):
-            return voice.id
-
-    for voice in voices:
-        vid = (getattr(voice, "id", "") or "").lower()
-        vname = (getattr(voice, "name", "") or "").lower()
-        if (
-            "/it" in vid
-            or "it-it" in vid
-            or "it_it" in vid
-            or "italian" in vname
-            or "italiano" in vname
-        ):
+        if any(k in " ".join(parts).lower() for k in keywords):
             return voice.id
     return None
 
 
 def speak_text(text: str, *, show_missing_voice_info: bool = False) -> None:
-    """Legge `text` ad alta voce. Preferire frasi corte per bassissima latenza percepita."""
     if not text or not text.strip():
         return
     if pyttsx3 is None:
-        st.warning("pyttsx3 non installato: TTS non disponibile.")
+        st.warning("pyttsx3 non installato.")
         return
-
     engine = None
     try:
         driver = _tts_driver_name()
@@ -181,22 +208,19 @@ def speak_text(text: str, *, show_missing_voice_info: bool = False) -> None:
             engine = pyttsx3.init(driverName=driver) if driver else pyttsx3.init()
         except Exception:
             engine = pyttsx3.init()
-
-        italian_voice = _pick_italian_voice(engine)
-        if italian_voice:
-            engine.setProperty("voice", italian_voice)
+        voice = _pick_italian_voice(engine)
+        if voice:
+            engine.setProperty("voice", voice)
         elif show_missing_voice_info:
-            st.info("Nessuna voce italiana trovata: uso quella predefinita.")
-
+            st.info("Nessuna voce italiana: uso quella predefinita.")
         engine.setProperty("rate", active_tts_rate())
         try:
             engine.setProperty("volume", 1.0)
         except Exception:
             pass
-
         engine.say(text.strip())
         engine.runAndWait()
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         st.warning(f"Errore TTS: {exc}")
     finally:
         if engine is not None:
@@ -210,178 +234,118 @@ def speak_text(text: str, *, show_missing_voice_info: bool = False) -> None:
 # Microfono
 # ---------------------------------------------------------------------------
 def listen_from_microphone() -> tuple[str | None, str | None]:
-    """Ascolta e trascrive in it-IT. In modalità rapida riduce i tempi di calibrazione."""
     if sr is None:
-        return None, "SpeechRecognition non è installato."
-
+        return None, "SpeechRecognition non installato."
     recognizer = sr.Recognizer()
     recognizer.dynamic_energy_threshold = True
     fast = is_fast_mode()
     recognizer.pause_threshold = 0.55 if fast else 0.7
-    ambient = 0.25 if fast else 0.45
-    phrase_limit = 12 if fast else 18
-
     try:
         with sr.Microphone() as source:
-            recognizer.adjust_for_ambient_noise(source, duration=ambient)
-            audio = recognizer.listen(source, timeout=4, phrase_time_limit=phrase_limit)
+            recognizer.adjust_for_ambient_noise(source, duration=0.25 if fast else 0.45)
+            audio = recognizer.listen(source, timeout=4, phrase_time_limit=12 if fast else 18)
     except sr.WaitTimeoutError:
-        return None, "Nessun audio rilevato. Riprova parlando subito dopo il click."
+        return None, "Nessun audio rilevato."
     except OSError as exc:
-        return (
-            None,
-            f"Microfono non accessibile ({exc}). Controlla PyAudio / esclusive LoL-Discord.",
-        )
+        return None, f"Microfono non accessibile: {exc}"
     except Exception as exc:
         return None, f"Errore microfono: {exc}"
-
     try:
         text = (recognizer.recognize_google(audio, language=SPEECH_LANG) or "").strip()
-        if not text:
-            return None, "Trascrizione vuota."
-        return text, None
+        return (text, None) if text else (None, "Trascrizione vuota.")
     except sr.UnknownValueError:
-        return None, "Audio non chiaro (game/Discord?). Riprova."
+        return None, "Audio non chiaro. Riprova."
     except sr.RequestError as exc:
-        return None, f"Riconoscimento non raggiungibile (serve Internet): {exc}"
+        return None, f"Riconoscimento non raggiungibile: {exc}"
     except Exception as exc:
         return None, f"Errore riconoscimento: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Screenshot (visione schermo)
-# ---------------------------------------------------------------------------
-def list_monitors() -> list[tuple[int, str]]:
-    """Elenco monitor mss: indice -> etichetta leggibile."""
-    if mss is None:
-        return [(1, "Monitor 1 (installa mss + Pillow)")]
-    try:
-        labels: list[tuple[int, str]] = []
-        with mss.mss() as sct:
-            # monitors[0] = virtual desktop completo; 1..n = singoli display
-            for idx, mon in enumerate(sct.monitors):
-                if idx == 0:
-                    labels.append((0, f"Tutti i monitor ({mon['width']}x{mon['height']})"))
-                else:
-                    labels.append(
-                        (
-                            idx,
-                            f"Monitor {idx} ({mon['width']}x{mon['height']} "
-                            f"@ {mon['left']},{mon['top']})",
-                        )
-                    )
-        return labels or [(1, "Monitor 1")]
-    except Exception as exc:
-        # Tipico in ambienti headless/CI; sul PC di gioco mss funziona di solito
-        return [(1, f"Monitor 1 (rilevamento fallito: {exc})")]
-
-
-def _resize_for_vision(img: "Image.Image", max_width: int) -> "Image.Image":
-    """Ridimensiona lo screenshot per ridurre latenza verso Ollama."""
-    if img.width > max_width:
-        ratio = max_width / float(img.width)
-        img = img.resize((max_width, max(1, int(img.height * ratio))), Image.Resampling.BILINEAR)
-    return img
-
-
-def _image_to_png_bytes(img: "Image.Image") -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-
-def capture_screen_png(
-    monitor_index: int = 1,
-    max_width: int = 1280,
-) -> tuple[bytes | None, str | None]:
-    """
-    Cattura uno screenshot PNG (ridimensionato per velocità verso Ollama).
-
-    Prova prima `mss` (multi-monitor), poi fallback `PIL.ImageGrab` (Win/macOS).
-    Ritorna (png_bytes, errore).
-    """
-    if Image is None:
-        return None, "Installa le dipendenze visione: pip install mss Pillow"
-
-    errors: list[str] = []
-
-    # 1) mss — migliore per scegliere il monitor del gioco
-    if mss is not None:
-        try:
-            with mss.mss() as sct:
-                monitors = sct.monitors
-                if monitor_index < 0 or monitor_index >= len(monitors):
-                    monitor_index = 1 if len(monitors) > 1 else 0
-                raw = sct.grab(monitors[monitor_index])
-                img = Image.frombytes("RGB", raw.size, raw.rgb)
-            img = _resize_for_vision(img, max_width)
-            return _image_to_png_bytes(img), None
-        except Exception as exc:
-            errors.append(f"mss: {exc}")
-
-    # 2) ImageGrab — fallback tipico su Windows/macOS
-    try:
-        from PIL import ImageGrab
-
-        grabbed = ImageGrab.grab(all_screens=(monitor_index == 0))
-        if grabbed.mode != "RGB":
-            grabbed = grabbed.convert("RGB")
-        grabbed = _resize_for_vision(grabbed, max_width)
-        return _image_to_png_bytes(grabbed), None
-    except Exception as exc:
-        errors.append(f"ImageGrab: {exc}")
-
-    detail = " | ".join(errors) if errors else "nessun backend disponibile"
-    return (
-        None,
-        f"Screenshot fallito ({detail}). Su LoL usa *borderless windowed* "
-        "se il fullscreen esclusivo blocca la cattura. Dipendenze: pip install mss Pillow",
-    )
-
-
-# ---------------------------------------------------------------------------
 # Prompt + Ollama
 # ---------------------------------------------------------------------------
-def build_system_prompt() -> str:
-    vision_on = bool(st.session_state.get("screen_vision", True))
+def build_system_prompt(live_sources: str) -> str:
     fast = is_fast_mode()
     brevity = (
-        "Massimo 2 frasi corte (~10-20 secondi di voce)."
+        "Massimo 2 frasi corte."
         if fast
-        else "Massimo 3-5 frasi corte (~20-40 secondi di voce)."
+        else "Massimo 3-5 frasi corte."
     )
     return SYSTEM_PROMPT_TEMPLATE.format(
         role=st.session_state.get("match_role", "Non specificato"),
         champion=(st.session_state.get("match_champion") or "Non specificato").strip()
         or "Non specificato",
         rank=st.session_state.get("match_rank", "Non specificato"),
-        enemy_notes=(st.session_state.get("match_enemy_notes") or "Nessuna").strip()
-        or "Nessuna",
-        vision_mode="ATTIVA (analizza lo screenshot allegato)" if vision_on else "spenta",
+        enemy_notes=(st.session_state.get("match_enemy_notes") or "Nessuna").strip() or "Nessuna",
+        live_sources=live_sources,
         speed_mode="RAPIDA" if fast else "normale",
         brevity_rule=brevity,
     )
 
 
-def stream_ollama_reply(messages: list[dict]) -> Generator[str, None, None]:
-    """Streaming da Ollama con limite token per velocità."""
-    if ollama is None:
-        yield "⚠️ Installa ollama: `pip install ollama`"
-        return
+def collect_realtime_context() -> tuple[str, list[bytes], str]:
+    """
+    Raccoglie briefing Live Client + frame recenti dal feed continuo.
 
+    Ritorna (blocco_testo_da_allegare_al_prompt, frames, descrizione_fonti).
+    """
+    chunks: list[str] = []
+    frames: list[bytes] = []
+    sources: list[str] = []
+
+    if st.session_state.get("live_client_api", True):
+        briefing, err, _raw = get_live_game_briefing()
+        if briefing:
+            chunks.append(briefing)
+            sources.append("Live Client API")
+            st.session_state["live_client_last_ok"] = True
+            st.session_state["live_client_last_error"] = None
+        else:
+            st.session_state["live_client_last_ok"] = False
+            st.session_state["live_client_last_error"] = err
+            chunks.append(
+                "=== LIVE CLIENT ===\n"
+                f"Non disponibile: {err}\n"
+                "(Avvia una partita o Practice Tool. L'API è su https://127.0.0.1:2999)"
+            )
+            sources.append("Live Client API (offline)")
+
+    if st.session_state.get("live_screen_feed", True):
+        sync_live_feed()
+        n = int(st.session_state.get("live_frame_count", 3))
+        frames = LIVE_FEED.recent_pngs(count=n, min_gap_s=0.35)
+        if frames:
+            sources.append(f"Feed video continuo ({len(frames)} frame)")
+            chunks.append(
+                f"=== FEED VIDEO ===\n"
+                f"Allegati {len(frames)} frame recenti dal monitor di gioco "
+                f"(cattura continua ~{st.session_state.get('live_fps', 2)} FPS). "
+                "Usali come visione in tempo reale della partita."
+            )
+        else:
+            sources.append("Feed video (buffer vuoto)")
+            chunks.append(
+                "=== FEED VIDEO ===\n"
+                "Buffer ancora vuoto o cattura fallita. "
+                f"Stato: {LIVE_FEED.status()}"
+            )
+
+    return "\n\n".join(chunks), frames, ", ".join(sources) if sources else "nessuna"
+
+
+def stream_ollama_reply(messages: list[dict]) -> Generator[str, None, None]:
+    if ollama is None:
+        yield "⚠️ Installa ollama: pip install ollama"
+        return
     model = active_model_name()
     try:
         stream = ollama.chat(
             model=model,
             messages=messages,
             stream=True,
-            options={
-                "num_predict": active_num_predict(),
-                "temperature": 0.4,
-            },
+            options={"num_predict": active_num_predict(), "temperature": 0.4},
         )
         for chunk in stream:
-            content = ""
             if isinstance(chunk, dict):
                 content = (chunk.get("message") or {}).get("content") or ""
             else:
@@ -391,9 +355,9 @@ def stream_ollama_reply(messages: list[dict]) -> Generator[str, None, None]:
                 yield content
     except Exception as exc:
         yield (
-            f"⚠️ Errore Ollama (`{model}`): {exc}\n\n"
-            "Se usi la visione schermo: `ollama pull qwen2.5vl` "
-            "(oppure `llava` / `llama3.2-vision`) e selezionalo in sidebar."
+            f"⚠️ Errore Ollama (`{model}`): {exc}\n"
+            "Per i frame video: `ollama pull qwen2.5vl`. "
+            "Con sola Live Client API puoi usare il modello testo `qwen`."
         )
 
 
@@ -401,67 +365,55 @@ _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
 
 def _split_complete_sentences(buffer: str) -> tuple[list[str], str]:
-    """Separa frasi complete dall'eventuale coda ancora incompleta."""
     parts = _SENTENCE_END.split(buffer)
     if len(parts) == 1:
         return [], buffer
-    complete = [p.strip() for p in parts[:-1] if p.strip()]
-    return complete, parts[-1]
+    return [p.strip() for p in parts[:-1] if p.strip()], parts[-1]
 
 
-def generate_assistant_reply(
-    messages: list[dict],
-    *,
-    speak_early: bool,
-) -> str:
-    """
-    Streaming a schermo. Se speak_early=True, la TTS parte alla prima frase
-    completa (comunicazione più reattiva in partita), poi continua col resto.
-    """
+def generate_assistant_reply(messages: list[dict], *, speak_early: bool) -> str:
     stream_area = st.empty()
-    full_response = ""
-    pending_speech = ""
-
+    full = ""
+    pending = ""
     for token in stream_ollama_reply(messages):
-        full_response += token
-        stream_area.markdown(full_response)
-
+        full += token
+        stream_area.markdown(full)
         if speak_early and st.session_state.get("tts_enabled", True):
-            pending_speech += token
-            sentences, pending_speech = _split_complete_sentences(pending_speech)
-            for sentence in sentences:
-                speak_text(sentence)
-
+            pending += token
+            sentences, pending = _split_complete_sentences(pending)
+            for s in sentences:
+                speak_text(s)
     if speak_early and st.session_state.get("tts_enabled", True):
-        rest = pending_speech.strip()
+        rest = pending.strip()
         if rest:
             speak_text(rest)
-    return full_response
+    return full
 
 
-def build_ollama_messages(user_text: str, image_png: bytes | None) -> list[dict]:
-    """
-    System + cronologia testuale + ultimo user message (con eventuale immagine).
-    Le immagini passate non vengono tenute in session_state per non gonfiare la RAM.
-    """
+def build_ollama_messages(
+    user_text: str,
+    *,
+    realtime_block: str,
+    frames: list[bytes],
+    live_sources: str,
+) -> list[dict]:
     history: list[dict] = []
     for m in st.session_state.messages:
-        if m["role"] not in ("user", "assistant"):
-            continue
-        # Solo testo in cronologia (niente vecchie immagini)
-        history.append({"role": m["role"], "content": m["content"]})
-
-    # L'ultimo user è già in history: lo sostituiamo con versione + image se serve
+        if m["role"] in ("user", "assistant"):
+            history.append({"role": m["role"], "content": m["content"]})
     if history and history[-1]["role"] == "user":
         history.pop()
 
-    user_msg: dict = {"role": "user", "content": user_text}
-    if image_png:
-        # API ollama-python: lista di bytes o path
-        user_msg["images"] = [image_png]
+    content = (
+        f"{realtime_block}\n\n"
+        f"=== DOMANDA GIOCATORE ===\n{user_text}"
+    )
+    user_msg: dict = {"role": "user", "content": content}
+    if frames:
+        user_msg["images"] = frames
 
     return [
-        {"role": "system", "content": build_system_prompt()},
+        {"role": "system", "content": build_system_prompt(live_sources)},
         *history,
         user_msg,
     ]
@@ -475,23 +427,27 @@ def init_session_state() -> None:
         "messages": [{"role": "assistant", "content": WELCOME_MESSAGE}],
         "last_spoken_index": -1,
         "pending_voice_prompt": None,
-        "pending_image_png": None,
         "match_role": "Non specificato",
         "match_champion": "",
         "match_rank": "Non specificato",
         "match_enemy_notes": "",
         "tts_enabled": True,
         "fast_mode": True,
-        "screen_vision": True,
+        "early_tts": True,
+        "live_client_api": True,
+        "live_screen_feed": True,
+        "live_fps": 2.0,
+        "live_frame_count": 3,
         "text_model": DEFAULT_TEXT_MODEL,
         "vision_model": DEFAULT_VISION_MODEL,
         "monitor_index": 1,
-        "show_screenshot_preview": True,
-        "early_tts": True,
+        "show_live_preview": True,
+        "live_client_last_ok": False,
+        "live_client_last_error": None,
     }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -520,19 +476,25 @@ def render_sidebar() -> None:
             else 0,
         )
         st.session_state.match_enemy_notes = st.text_area(
-            "Avversario / note rapide",
+            "Note rapide",
             value=st.session_state.match_enemy_notes,
-            placeholder="es. vs Darius, no flash",
-            height=70,
+            placeholder="es. focus sull'ADC",
+            height=60,
         )
 
         st.divider()
-        st.subheader("👁️ Visione schermo")
-        st.session_state.screen_vision = st.toggle(
-            "Vedi lo schermo (screenshot → AI)",
-            value=st.session_state.screen_vision,
-            help="Serve un modello vision in Ollama, es. qwen2.5vl o llava.",
+        st.subheader("🔴 Tempo reale")
+        st.session_state.live_client_api = st.toggle(
+            "Live Client API (stato partita Riot)",
+            value=st.session_state.live_client_api,
+            help="Legge gold, KDA, eventi, HP ecc. da https://127.0.0.1:2999 mentre giochi.",
         )
+        st.session_state.live_screen_feed = st.toggle(
+            "Feed schermo continuo (vede la partita)",
+            value=st.session_state.live_screen_feed,
+            help="Cattura frame in background (~2 FPS). Alla domanda invia gli ultimi frame, non uno screen singolo.",
+        )
+
         monitors = list_monitors()
         labels = [label for _, label in monitors]
         indices = [idx for idx, _ in monitors]
@@ -540,150 +502,207 @@ def render_sidebar() -> None:
             current = indices.index(st.session_state.monitor_index)
         except ValueError:
             current = min(1, len(indices) - 1)
-        chosen = st.selectbox("Monitor da catturare", labels, index=current)
+        chosen = st.selectbox("Monitor di gioco", labels, index=current)
         st.session_state.monitor_index = indices[labels.index(chosen)]
-        st.session_state.show_screenshot_preview = st.toggle(
-            "Anteprima screenshot in chat",
-            value=st.session_state.show_screenshot_preview,
+
+        st.session_state.live_fps = st.slider(
+            "FPS feed video",
+            min_value=1.0,
+            max_value=4.0,
+            value=float(st.session_state.live_fps),
+            step=0.5,
+        )
+        st.session_state.live_frame_count = st.slider(
+            "Frame inviati per domanda",
+            min_value=1,
+            max_value=5,
+            value=int(st.session_state.live_frame_count),
+        )
+        st.session_state.show_live_preview = st.toggle(
+            "Anteprima live in sidebar",
+            value=st.session_state.show_live_preview,
         )
         st.session_state.vision_model = st.text_input(
-            "Modello vision Ollama",
+            "Modello vision (per feed frame)",
             value=st.session_state.vision_model,
         )
-        st.caption("Esempio setup: `ollama pull qwen2.5vl`")
+        st.session_state.text_model = st.text_input(
+            "Modello testo (se feed OFF)",
+            value=st.session_state.text_model,
+        )
+
+        sync_live_feed()
+        feed_status = LIVE_FEED.status()
+        if st.session_state.live_client_api:
+            if st.session_state.get("live_client_last_ok"):
+                st.success("Live Client: dati ok (ultima lettura)")
+            elif st.session_state.get("live_client_last_error"):
+                st.warning("Live Client: in attesa di partita")
+            else:
+                st.info("Live Client: verrà letto a ogni domanda")
+        if st.session_state.live_screen_feed:
+            if feed_status["running"] and feed_status["buffered_frames"] > 0:
+                st.success(
+                    f"Feed video: LIVE · {feed_status['buffered_frames']} frame in buffer · "
+                    f"totale {feed_status['frames_captured']}"
+                )
+            elif feed_status["running"]:
+                st.info("Feed video: avviato, buffer in riempimento…")
+            else:
+                st.warning("Feed video: non in esecuzione")
+            if feed_status.get("last_error"):
+                st.caption(f"Cattura: {feed_status['last_error']}")
 
         st.divider()
         st.subheader("⚡ Velocità")
         st.session_state.fast_mode = st.toggle(
-            "Modalità rapida (consigliata in-game)",
+            "Modalità rapida",
             value=st.session_state.fast_mode,
-            help="Risposte più corte, mic più reattivo, TTS più veloce, meno token.",
         )
         st.session_state.early_tts = st.toggle(
-            "TTS dalla prima frase (non aspettare tutta la risposta)",
+            "TTS dalla prima frase",
             value=st.session_state.early_tts,
         )
         st.session_state.tts_enabled = st.toggle(
             "Sintesi vocale attiva",
             value=st.session_state.tts_enabled,
         )
-        st.session_state.text_model = st.text_input(
-            "Modello testo (se visione OFF)",
-            value=st.session_state.text_model,
-        )
-
         st.caption(
-            f"Modello attivo: `{active_model_name()}` · "
-            f"max token: `{active_num_predict()}` · "
-            f"TTS rate: `{active_tts_rate()}`"
+            f"Modello: `{active_model_name()}` · token `{active_num_predict()}` · "
+            f"TTS `{active_tts_rate()}` · OS `{platform.system()}`"
         )
-        st.caption(f"OS: `{platform.system()} ({sys.platform})`")
 
         if st.button("🗑️ Nuova conversazione", use_container_width=True):
             st.session_state.messages = [
-                {
-                    "role": "assistant",
-                    "content": "Chat azzerata. Contesto partita invariato. Dimmi pure.",
-                }
+                {"role": "assistant", "content": "Chat azzerata. Il feed live continua."}
             ]
             st.session_state.pending_voice_prompt = None
-            st.session_state.pending_image_png = None
             st.rerun()
 
         st.divider()
         st.markdown(
-            "**In partita:** LoL preferibilmente in *borderless*, "
-            "app su secondo monitor. Clicca il microfono e parla: "
-            "con visione ON viene allegato lo screenshot del monitor scelto."
+            "**Tempo reale ≠ screenshot:** la Live Client API aggiorna lo stato "
+            "di gioco continuamente; il feed cattura la partita in background. "
+            "LoL in *borderless*, app sul 2° monitor."
         )
+
+
+@st.fragment(run_every=2.0)
+def render_live_preview() -> None:
+    """Anteprima che si aggiorna da sola: stato API + ultimo frame del feed."""
+    st.markdown("##### Monitor live")
+    cols = st.columns(2)
+    with cols[0]:
+        if st.session_state.get("live_client_api", True):
+            briefing, err, _ = get_live_game_briefing()
+            if briefing:
+                st.session_state["live_client_last_ok"] = True
+                # mostra solo le prime righe
+                preview = "\n".join(briefing.splitlines()[:12])
+                st.code(preview, language="text")
+            else:
+                st.session_state["live_client_last_ok"] = False
+                st.caption(err or "In attesa della partita…")
+        else:
+            st.caption("Live Client disattivata")
+    with cols[1]:
+        if st.session_state.get("live_screen_feed", True):
+            sync_live_feed()
+            frame = LIVE_FEED.latest_png()
+            if frame:
+                st.image(frame, caption="Ultimo frame del feed continuo", use_container_width=True)
+            else:
+                st.caption("Nessun frame ancora (avvio feed / controlla monitor)")
+        else:
+            st.caption("Feed schermo disattivato")
 
 
 def render_chat_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            if message.get("image_png") and st.session_state.get("show_screenshot_preview", True):
-                st.image(message["image_png"], caption="Screenshot analizzato", use_container_width=True)
+            if message.get("preview_frames") and st.session_state.get("show_live_preview", True):
+                # mostra solo l'ultimo frame in chat per non appesantire
+                st.image(
+                    message["preview_frames"][-1],
+                    caption=f"Frame live usati: {len(message['preview_frames'])}",
+                    use_container_width=True,
+                )
             st.markdown(message["content"])
 
 
-def handle_user_prompt(prompt: str, image_png: bytes | None = None) -> None:
+def handle_user_prompt(prompt: str) -> None:
     prompt = (prompt or "").strip()
     if not prompt:
         return
 
-    # Se visione attiva e nessuna immagine passata, cattura ora
-    capture_error = None
-    if st.session_state.get("screen_vision", True) and image_png is None:
-        with st.spinner("Catturo lo schermo..."):
-            image_png, capture_error = capture_screen_png(
-                monitor_index=int(st.session_state.get("monitor_index", 1)),
-            )
-        if capture_error:
-            st.warning(capture_error)
+    with st.spinner("Leggo la partita in tempo reale..."):
+        realtime_block, frames, live_sources = collect_realtime_context()
 
     user_entry: dict = {"role": "user", "content": prompt}
-    if image_png and st.session_state.get("show_screenshot_preview", True):
-        user_entry["image_png"] = image_png
+    if frames:
+        user_entry["preview_frames"] = frames[-1:]  # anteprima leggera in history
 
     st.session_state.messages.append(user_entry)
     with st.chat_message("user"):
-        if image_png and st.session_state.get("show_screenshot_preview", True):
-            st.image(image_png, caption="Screenshot analizzato", use_container_width=True)
+        if frames:
+            st.image(
+                frames[-1],
+                caption=f"Contesto video: {len(frames)} frame recenti · {live_sources}",
+                use_container_width=True,
+            )
         st.markdown(prompt)
+        with st.expander("Dati live inviati al modello"):
+            st.code(realtime_block[:3500], language="text")
 
-    ollama_messages = build_ollama_messages(prompt, image_png)
+    messages = build_ollama_messages(
+        prompt,
+        realtime_block=realtime_block,
+        frames=frames,
+        live_sources=live_sources,
+    )
     speak_early = bool(st.session_state.get("early_tts", True)) and bool(
         st.session_state.get("tts_enabled", True)
     )
 
     with st.chat_message("assistant"):
-        with st.spinner("Il coach guarda la situation..." if image_png else "Il coach sta pensando..."):
-            full_response = generate_assistant_reply(
-                ollama_messages,
-                speak_early=speak_early,
-            )
+        with st.spinner(f"Coach ({active_model_name()})…"):
+            full_response = generate_assistant_reply(messages, speak_early=speak_early)
 
     st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-    # Se early TTS è off, parla tutto a fine generazione (comportamento classico)
     if st.session_state.get("tts_enabled", True) and not speak_early:
         speak_text(full_response, show_missing_voice_info=True)
-
     st.session_state.last_spoken_index = len(st.session_state.messages) - 1
 
 
 def main() -> None:
     st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="centered")
     init_session_state()
+    sync_live_feed()
 
-    st.title("⚔️ LoL Coach")
+    st.title("⚔️ LoL Coach — Tempo reale")
     st.caption(
-        "Coach vocale locale con visione schermo — microfono + screenshot → "
-        f"Ollama (`{active_model_name()}`)."
+        "Vede la partita in live (Riot Live Client + feed schermo continuo) · "
+        f"modello `{active_model_name()}`"
     )
 
     render_sidebar()
+    if st.session_state.get("show_live_preview", True):
+        render_live_preview()
+
     render_chat_history()
 
     c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
     with c1:
         mic_clicked = st.button("🎙️ Chiedi al Coach", use_container_width=True, type="primary")
     with c2:
-        shot_clicked = st.button("📸 Solo schermo", use_container_width=True)
+        now_clicked = st.button("🔴 Analizza ora (live)", use_container_width=True)
     with c3:
-        st.caption("Mic = voce (+ screenshot se visione ON). Solo schermo = «cosa faccio ora?» sullo screenshot.")
+        st.caption(
+            "Ogni domanda legge lo stato live corrente + gli ultimi frame del feed, "
+            "non uno screenshot isolato."
+        )
 
     if mic_clicked:
-        image_png = None
-        # Screenshot PRIMA del mic: cattura il frame di gioco, non la UI mentre parli
-        if st.session_state.get("screen_vision", True):
-            with st.spinner("Screenshot..."):
-                image_png, err = capture_screen_png(
-                    monitor_index=int(st.session_state.get("monitor_index", 1)),
-                )
-            if err:
-                st.warning(err)
-
         with st.spinner("Ti ascolto..."):
             text, error = listen_from_microphone()
         if error:
@@ -691,35 +710,21 @@ def main() -> None:
         elif text:
             st.success(f"Hai detto: {text}")
             st.session_state.pending_voice_prompt = text
-            st.session_state.pending_image_png = image_png
             st.rerun()
 
-    if shot_clicked:
-        if not st.session_state.get("screen_vision", True):
-            st.warning("Attiva «Vedi lo schermo» in sidebar per usare questo pulsante.")
-        else:
-            with st.spinner("Screenshot..."):
-                image_png, err = capture_screen_png(
-                    monitor_index=int(st.session_state.get("monitor_index", 1)),
-                )
-            if err:
-                st.warning(err)
-            else:
-                st.session_state.pending_voice_prompt = (
-                    "Guarda lo screenshot della mia partita di League of Legends: "
-                    "cosa dovrei fare ora? Risposta brevissima."
-                )
-                st.session_state.pending_image_png = image_png
-                st.rerun()
+    if now_clicked:
+        st.session_state.pending_voice_prompt = (
+            "Basandoti sullo stato LIVE della partita in questo istante, "
+            "cosa dovrei fare ora? Risposta brevissima."
+        )
+        st.rerun()
 
     if st.session_state.pending_voice_prompt:
         voice_prompt = st.session_state.pending_voice_prompt
-        image_png = st.session_state.pending_image_png
         st.session_state.pending_voice_prompt = None
-        st.session_state.pending_image_png = None
-        handle_user_prompt(voice_prompt, image_png=image_png)
+        handle_user_prompt(voice_prompt)
 
-    typed = st.chat_input("Scrivi qui (con visione ON allega comunque lo screenshot)...")
+    typed = st.chat_input("Domanda (usa sempre i dati live della partita)...")
     if typed:
         handle_user_prompt(typed)
 
