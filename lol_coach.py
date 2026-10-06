@@ -1,9 +1,8 @@
 """
 LoL Coach — assistente vocale con visione DELLA PARTITA IN TEMPO REALE.
 
-Fonti tempo reale:
-1) Riot Live Client Data API (stato strutturato mentre giochi)
-2) Feed schermo continuo (ring buffer di frame, non screenshot singolo)
+Fonte principale (default): feed schermo continuo — nessuna API key Riot.
+Extra opzionale: Live Client locale su 127.0.0.1:2999 (niente developer portal).
 
 Avvio:
     streamlit run lol_coach.py

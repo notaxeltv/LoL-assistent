@@ -1,8 +1,9 @@
 """
 Tempo reale per LoL Coach.
 
-1) Riot Live Client Data API (https://127.0.0.1:2999) — stato partita strutturato
-2) LiveScreenFeed — cattura continua dello schermo in un ring buffer (frame recenti)
+1) LiveScreenFeed — cattura continua dello schermo (fonte principale, no API Riot)
+2) Live Client Data locale (https://127.0.0.1:2999) — opzionale, nessuna API key:
+   la espone il client LoL solo in partita sul tuo PC (non è il Developer Portal).
 """
 
 from __future__ import annotations
