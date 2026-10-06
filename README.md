@@ -1,49 +1,42 @@
-# LoL Coach — Assistente vocale per League of Legends
+# LoL Coach — Assistente vocale + visione schermo
 
-App Streamlit locale: parli al **microfono** durante una partita di LoL, **Qwen** (Ollama) ti risponde da coach, e **pyttsx3** legge la risposta ad alta voce.
+Coach locale per League of Legends: parli al **microfono**, l’app può **vedere lo schermo** (screenshot → modello vision Ollama) e risponderti a voce in modo **rapido**.
 
-Ideale su secondo monitor / Alt-Tab: *«sono under vs Darius, cosa faccio?»*, *«vado dragon o farm?»*, *«prossima item?»*.
+## Funzionalità
+
+| Feature | Dettaglio |
+|---------|-----------|
+| Microfono | SpeechRecognition `it-IT` → prompt automatico |
+| Visione schermo | Screenshot con `mss` + modello vision (`qwen2.5vl` / `llava`…) |
+| Solo schermo | Pulsante **📸 Solo schermo** = «cosa faccio ora?» sullo screenshot |
+| Modalità rapida | Meno token, mic più reattivo, TTS più veloce |
+| TTS anticipata | Inizia a parlare dalla **prima frase**, senza aspettare tutta la risposta |
+| Contesto | Ruolo, campione, rank, note avversario in sidebar |
 
 ## Prerequisiti
 
-1. [Ollama](https://ollama.com) in esecuzione
-2. Modello:
-
 ```bash
+# Modello testo (già in uso)
 ollama pull qwen
-```
 
-3. Python 3.10+ consigliato
+# Modello vision (necessario per "Vedi lo schermo")
+ollama pull qwen2.5vl
+# alternative: ollama pull llava   oppure   ollama pull llama3.2-vision
+```
 
 ## Installazione
 
 ```bash
-pip install streamlit ollama SpeechRecognition pyttsx3 PyAudio
-# oppure
 pip install -r requirements.txt
 ```
 
+Dipendenze extra per la visione: `mss`, `Pillow`.
+
 ### PyAudio per OS
 
-**Windows**
-```bash
-pip install pipwin
-pipwin install pyaudio
-```
-
-**macOS**
-```bash
-brew install portaudio
-pip install PyAudio
-```
-
-**Linux (Debian/Ubuntu)**
-```bash
-sudo apt install -y portaudio19-dev python3-pyaudio espeak espeak-ng
-pip install PyAudio
-```
-
-> La trascrizione (`recognize_google`) richiede Internet. Il LLM resta locale via Ollama.
+**Windows:** `pip install pipwin && pipwin install pyaudio`  
+**macOS:** `brew install portaudio && pip install PyAudio`  
+**Linux:** `sudo apt install portaudio19-dev espeak espeak-ng && pip install PyAudio`
 
 ## Avvio
 
@@ -51,22 +44,12 @@ pip install PyAudio
 streamlit run lol_coach.py
 ```
 
-(`streamlit run jarvis_chat.py` funziona ancora: reindirizza a LoL Coach.)
-
 ## Uso in partita
 
-1. Prima del loadout: in sidebar imposta **ruolo**, **campione**, **rank** e note sull’avversario
-2. In game: clicca **🎙️ Chiedi al Coach** e parla in italiano
-3. Qwen risponde in streaming; a fine risposta la TTS legge il consiglio
-4. Puoi anche digitare nella barra in basso
+1. LoL in **borderless windowed** (il fullscreen esclusivo a volte blocca lo screenshot)
+2. App su secondo monitor; in sidebar scegli il **monitor** dove gira LoL
+3. Attiva **Vedi lo schermo** + **Modalità rapida**
+4. **🎙️ Chiedi al Coach** → screenshot immediato + ascolto microfono
+5. Oppure **📸 Solo schermo** se non vuoi parlare
 
-Il system prompt forza risposte **brevi e azionabili** (stile coach in cuffia), non guide lunghe da wiki.
-
-## File
-
-```
-lol_coach.py       # App principale (coach LoL + voce)
-jarvis_chat.py     # Alias di avvio per compatibilità
-requirements.txt
-README.md
-```
+> La trascrizione Google richiede Internet. LLM e visione restano locali via Ollama.
